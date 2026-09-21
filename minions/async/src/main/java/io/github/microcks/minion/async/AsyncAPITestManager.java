@@ -111,12 +111,32 @@ public class AsyncAPITestManager {
          logger.infof("Launching a new AsyncAPITestThread for {%s} on {%s}", specification.getTestResultId(),
                specification.getEndpointUrl());
 
-         // Start initialising a TestCaseReturn and build the correct MessageConsumptionTasK.
+         // Start initialising a TestCaseReturn and actually start the test counter.
          TestCaseReturnDTO testCaseReturn = new TestCaseReturnDTO(specification.getOperationName());
-         MessageConsumptionTask messageConsumptionTask = buildMessageConsumptionTask(specification);
-
-         // Actually start test counter.
          startTime = System.currentTimeMillis();
+
+         try {
+            runTest(testCaseReturn);
+         } catch (Exception e) {
+            // A test that never reports its result leaves the TestResult in progress forever: always turn an
+            // unexpected failure into a reported failure.
+            logger.errorf(e, "Caught an unexpected exception while running test {%s}", specification.getTestResultId());
+            testCaseReturn.addTestReturn(new TestReturn(TestReturn.FAILURE_CODE, System.currentTimeMillis() - startTime,
+                  "Exception: unexpected failure: " + e.getMessage(), null, null));
+         } finally {
+            // Finally, report the testCase results using Microcks API.
+            try {
+               microcksAPIConnector.reportTestCaseResult(specification.getTestResultId(), testCaseReturn);
+            } catch (Exception e) {
+               logger.errorf(e, "Reporting test case result for {%s} failed", specification.getTestResultId());
+            }
+         }
+      }
+
+      /** Actually run the test, completing {@code testCaseReturn} with consumption and validation results. */
+      private void runTest(TestCaseReturnDTO testCaseReturn) {
+         // Build the correct MessageConsumptionTask.
+         MessageConsumptionTask messageConsumptionTask = buildMessageConsumptionTask(specification);
          List<ConsumedMessage> outputs = null;
 
          if (messageConsumptionTask != null) {
@@ -167,9 +187,6 @@ public class AsyncAPITestManager {
             logger.infof("No consumed message to validate, test {%s} will be marked as timed-out",
                   specification.getTestResultId());
          }
-
-         // Finally, report the testCase results using Microcks API.
-         microcksAPIConnector.reportTestCaseResult(specification.getTestResultId(), testCaseReturn);
       }
 
       /**
@@ -177,7 +194,7 @@ public class AsyncAPITestManager {
        * @param testCaseReturn The TestCase to complete with schema validation results
        * @param outputs        The consumed messages from tested endpoint.
        */
-      private void validateConsumedMessages(TestCaseReturnDTO testCaseReturn, List<ConsumedMessage> outputs) {
+      void validateConsumedMessages(TestCaseReturnDTO testCaseReturn, List<ConsumedMessage> outputs) {
          JsonNode specificationNode = null;
          try {
             specificationNode = AsyncAPISchemaValidator.getJsonNodeForSchema(specification.getAsyncAPISpec());
@@ -250,6 +267,12 @@ public class AsyncAPITestManager {
                      JsonNode payloadNode = AsyncAPISchemaValidator.getJsonNode(responseContent);
                      errors = AsyncAPISchemaValidator.validateJsonMessage(specificationNode, payloadNode,
                            messagePathPointer, microcksUrl + "/api/resources/");
+                  } else {
+                     // No schema based validation is possible for this content type (text/plain, protobuf, ...):
+                     // having received the message is the only thing we can assert here.
+                     logger.infof("Content type {%s} cannot be schema validated, message is considered valid",
+                           expectedContentType);
+                     errors = List.of();
                   }
 
                   if (errors == null || errors.isEmpty()) {
@@ -301,7 +324,8 @@ public class AsyncAPITestManager {
       }
 
       /** Find the appropriate MessageConsumptionTask implementation depending on specification. */
-      private MessageConsumptionTask buildMessageConsumptionTask(AsyncTestSpecification testSpecification) {
+      /** Build the MessageConsumptionTask matching the endpoint of this test specification. */
+      MessageConsumptionTask buildMessageConsumptionTask(AsyncTestSpecification testSpecification) {
          if (KafkaMessageConsumptionTask.acceptEndpoint(testSpecification.getEndpointUrl().trim())) {
             return new KafkaMessageConsumptionTask(testSpecification);
          }

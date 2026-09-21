@@ -216,6 +216,10 @@ public class AsyncAPISchemaValidator {
          avroSchema = retrieveMessageAvroSchema(specificationNode, messagePathPointer, schemaMap);
       } catch (AsyncAPISchemaException e) {
          return List.of(e.getMessage());
+      } catch (RuntimeException re) {
+         // Last resort net: we must return validation errors, never fail the calling test thread.
+         log.warn("Unexpected exception while retrieving Avro schema from AsyncAPI spec", re);
+         return List.of("Avro schema cannot be retrieved from AsyncAPI spec: " + re);
       }
 
       List<String> errors = new ArrayList<>();
@@ -229,6 +233,11 @@ public class AsyncAPISchemaValidator {
          errors.add("Avro schema cannot be used to read message: " + ate.getMessage());
       } catch (IOException ioe) {
          errors.add("IOException while trying to validate message: " + ioe.getMessage());
+      } catch (RuntimeException re) {
+         // Malformed binaries may raise ArrayIndexOutOfBounds or NegativeArraySize exceptions that are not
+         // AvroRuntimeException, hence the broader catch here.
+         log.warn("Unexpected exception while reading Avro message", re);
+         errors.add("Avro binary cannot be read using schema from AsyncAPI spec: " + re);
       }
       return errors;
    }
@@ -253,14 +262,23 @@ public class AsyncAPISchemaValidator {
          avroSchema = retrieveMessageAvroSchema(specificationNode, messagePathPointer, schemaMap);
       } catch (AsyncAPISchemaException e) {
          return List.of(e.getMessage());
+      } catch (RuntimeException re) {
+         // Last resort net: we must return validation errors, never fail the calling test thread.
+         log.warn("Unexpected exception while retrieving Avro schema from AsyncAPI spec", re);
+         return List.of("Avro schema cannot be retrieved from AsyncAPI spec: " + re);
       }
 
       // Validation is a deep one. Each element should be checked.
-      if (AvroUtil.validate(avroSchema, avroRecord)) {
-         return List.of();
+      try {
+         if (AvroUtil.validate(avroSchema, avroRecord)) {
+            return List.of();
+         }
+         // Produce some insights on what's going wrong. We'll accumulate the errors on different schemas.
+         return AvroUtil.getValidationErrors(avroSchema, avroRecord);
+      } catch (RuntimeException re) {
+         log.warn("Unexpected exception while validating Avro record", re);
+         return List.of("Avro record cannot be validated against schema from AsyncAPI spec: " + re);
       }
-      // Produce some insights on what's going wrong. We'll accumulate the errors on different schemas.
-      return AvroUtil.getValidationErrors(avroSchema, avroRecord);
    }
 
    /**

@@ -15,6 +15,7 @@
  */
 package io.github.microcks.util;
 
+import org.apache.avro.AvroTypeException;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaBuilder;
 import org.apache.avro.SchemaCompatibility;
@@ -297,5 +298,122 @@ class AvroUtilTest {
       for (String error : errors) {
          assertEquals("age is not an integer", error);
       }
+   }
+
+   /** Write a datum using the given writer schema. Passing a union makes Avro emit a leading branch index. */
+   private static byte[] writeDatum(GenericRecord record, Schema writerSchema) throws Exception {
+      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+      Encoder encoder = EncoderFactory.get().binaryEncoder(baos, null);
+      new GenericDatumWriter<Object>(writerSchema).write(record, encoder);
+      encoder.flush();
+      return baos.toByteArray();
+   }
+
+   @Test
+   void testAvroToAvroRecordWithUnionEncodedBinary() throws Exception {
+      Schema cat = SchemaBuilder.record("Cat").fields().requiredString("name").endRecord();
+      Schema chat = SchemaBuilder.record("Chat").fields().requiredString("nom").endRecord();
+      Schema union = SchemaBuilder.unionOf().type(cat).and().type(chat).endUnion();
+
+      GenericRecord tigresse = new GenericData.Record(cat);
+      tigresse.put("name", "Tigresse");
+
+      // Written with the union as writer schema, so the binary starts with a branch index.
+      byte[] avroBinary = writeDatum(tigresse, union);
+
+      GenericRecord record = AvroUtil.avroToAvroRecord(avroBinary, union);
+      assertEquals("Cat", record.getSchema().getName());
+      assertEquals("Tigresse", record.get("name").toString());
+   }
+
+   @Test
+   void testAvroToAvroRecordWithUnionEncodedSecondBranch() throws Exception {
+      Schema cat = SchemaBuilder.record("Cat").fields().requiredString("name").endRecord();
+      Schema chat = SchemaBuilder.record("Chat").fields().requiredString("nom").endRecord();
+      Schema union = SchemaBuilder.unionOf().type(cat).and().type(chat).endUnion();
+
+      GenericRecord minou = new GenericData.Record(chat);
+      minou.put("nom", "Minou");
+
+      byte[] avroBinary = writeDatum(minou, union);
+
+      // The branch index must be honored: without it, the datum would be read as a Cat.
+      GenericRecord record = AvroUtil.avroToAvroRecord(avroBinary, union);
+      assertEquals("Chat", record.getSchema().getName());
+      assertEquals("Minou", record.get("nom").toString());
+   }
+
+   @Test
+   void testAvroToJsonWithUnionEncodedBinary() throws Exception {
+      Schema cat = SchemaBuilder.record("Cat").fields().requiredString("name").endRecord();
+      Schema chat = SchemaBuilder.record("Chat").fields().requiredString("nom").endRecord();
+      Schema union = SchemaBuilder.unionOf().type(cat).and().type(chat).endUnion();
+
+      GenericRecord minou = new GenericData.Record(chat);
+      minou.put("nom", "Minou");
+
+      String jsonRepresentation = AvroUtil.avroToJson(writeDatum(minou, union), union);
+
+      assertTrue(jsonRepresentation.contains("\"nom\""));
+      assertTrue(jsonRepresentation.contains("\"Minou\""));
+   }
+
+   @Test
+   void testAvroToAvroRecordWithBareBranchBinary() throws Exception {
+      Schema cat = SchemaBuilder.record("Cat").fields().requiredString("name").endRecord();
+      Schema chat = SchemaBuilder.record("Chat").fields().requiredString("nom").endRecord();
+      Schema union = SchemaBuilder.unionOf().type(cat).and().type(chat).endUnion();
+
+      GenericRecord tigresse = new GenericData.Record(cat);
+      tigresse.put("name", "Tigresse");
+
+      // Written with a single branch as writer schema: no leading branch index. This is what the Microcks
+      // producer emits for union typed messages, so it must keep being readable.
+      byte[] avroBinary = writeDatum(tigresse, cat);
+
+      GenericRecord record = AvroUtil.avroToAvroRecord(avroBinary, union);
+      assertEquals("Tigresse", record.get("name").toString());
+   }
+
+   @Test
+   void testAvroToAvroRecordWithUnreadableBinaryThrowsAvroTypeException() {
+      Schema cat = SchemaBuilder.record("Cat").fields().requiredString("name").endRecord();
+      Schema chat = SchemaBuilder.record("Chat").fields().requiredString("nom").endRecord();
+      Schema union = SchemaBuilder.unionOf().type(cat).and().type(chat).endUnion();
+
+      byte[] garbage = new byte[] { -1, -1, -1, -1, -1, -1, -1, -1 };
+
+      // Whatever the underlying Avro failure is, it must surface as a typed AvroTypeException naming the
+      // branches that have been tried, never as an unchecked exception escaping to the caller.
+      AvroTypeException ate = assertThrows(AvroTypeException.class, () -> AvroUtil.avroToAvroRecord(garbage, union));
+      assertTrue(ate.getMessage().contains("Cat"));
+      assertTrue(ate.getMessage().contains("Chat"));
+   }
+
+   @Test
+   void testGetValidationErrorsOnTopLevelNonRecordSchema() {
+      // Top-level call passes no field name: this must not raise an ArrayIndexOutOfBoundsException.
+      List<String> errors = AvroUtil.getValidationErrors(SchemaBuilder.builder().stringType(), 42);
+      assertFalse(errors.isEmpty());
+   }
+
+   @Test
+   void testGetValidationErrorsOnArrayOfWrongTypedElements() {
+      Schema schema = SchemaBuilder.record("Team").fields().name("members").type().array().items().stringType()
+            .noDefault().endRecord();
+
+      GenericRecord team = new GenericData.Record(schema);
+      team.put("members", List.of(1, 2, 3));
+
+      List<String> errors = AvroUtil.getValidationErrors(schema, team);
+      assertFalse(errors.isEmpty());
+   }
+
+   @Test
+   void testGetValidationErrorsOnTopLevelUnionOfPrimitives() {
+      Schema union = SchemaBuilder.unionOf().stringType().and().intType().endUnion();
+
+      List<String> errors = AvroUtil.getValidationErrors(union, Boolean.TRUE);
+      assertFalse(errors.isEmpty());
    }
 }

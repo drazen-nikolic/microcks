@@ -20,6 +20,7 @@ import io.github.microcks.util.SchemaMap;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import org.apache.avro.AvroRuntimeException;
 import org.apache.avro.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,7 +37,19 @@ public class AsyncAPISchemaUtil {
    private static final Logger log = LoggerFactory.getLogger(AsyncAPISchemaUtil.class);
 
    public static final String ASYNC_SCHEMA_PAYLOAD_ELEMENT = "payload";
+
+   /**
+    * Prefix of the {@code schemaFormat} media types denoting an Apache Avro schema. Real-world documents use both
+    * {@code application/vnd.apache.avro;version=1.9.0} and {@code application/vnd.apache.avro+json;version=1.9.0} so
+    * detection is always done on a prefix basis.
+    */
+   public static final String AVRO_SCHEMA_FORMAT_PREFIX = "application/vnd.apache.avro";
+
    private static final String ONE_OF_STRUCT = "oneOf";
+   private static final String REF_ELEMENT = "$ref";
+   private static final String SCHEMA_ELEMENT = "schema";
+   private static final String SCHEMA_FORMAT_ELEMENT = "schemaFormat";
+   private static final String TYPE_ELEMENT = "type";
 
 
    /** Private constructor to hide the implicit one. */
@@ -90,12 +103,13 @@ public class AsyncAPISchemaUtil {
          if (messagesNode.size() > 1) {
             return buildOneOfMessagesAvroSchemas(specificationNode, (ArrayNode) messageNode, schemaMap);
          }
-         return buildSingleMessageAvroSchema(followRefIfAny(messagesNode.get(0), specificationNode), schemaMap);
+         return buildSingleMessageAvroSchema(followRefIfAny(messagesNode.get(0), specificationNode), specificationNode,
+               schemaMap);
       } else if (messageNode.has(ONE_OF_STRUCT)) {
          ArrayNode oneOfMessageNode = (ArrayNode) messageNode.get(ONE_OF_STRUCT);
          return buildOneOfMessagesAvroSchemas(specificationNode, oneOfMessageNode, schemaMap);
       } else {
-         return buildSingleMessageAvroSchema(messageNode, schemaMap);
+         return buildSingleMessageAvroSchema(messageNode, specificationNode, schemaMap);
       }
    }
 
@@ -110,51 +124,122 @@ public class AsyncAPISchemaUtil {
          JsonNode altMessageNode = oneOfMessageNode.get(i);
          // Extract a schema for each messages
          altMessageNode = followRefIfAny(altMessageNode, specificationNode);
-         schemas[i] = buildSingleMessageAvroSchema(altMessageNode, schemaMap);
+         schemas[i] = buildSingleMessageAvroSchema(altMessageNode, specificationNode, schemaMap);
       }
 
-      return Schema.createUnion(schemas);
+      try {
+         return Schema.createUnion(schemas);
+      } catch (AvroRuntimeException are) {
+         // Union creation fails on duplicated or nested union branches. Turn this unchecked exception into the
+         // checked one callers already handle so that it is reported as a validation error.
+         log.info("oneOf message schemas cannot be assembled into an Avro union: {}", are.getMessage());
+         throw new AsyncAPISchemaException("oneOf messages cannot be assembled into an Avro union: " + are.getMessage(),
+               are);
+      }
    }
 
-   /** Build an Avro schema for spring message definition. */
-   private static Schema buildSingleMessageAvroSchema(JsonNode messageNode, SchemaMap schemaMap)
-         throws AsyncAPISchemaException {
+   /**
+    * Check whether a {@code schemaFormat} media type denotes an Apache Avro schema. Matching is done on a prefix basis
+    * because AsyncAPI documents use several flavors of that media type: the plain {@code application/vnd.apache.avro}
+    * one, the {@code +json} variant and an optional {@code ;version=} parameter.
+    * @param schemaFormat The schemaFormat value found in an AsyncAPI document, may be null
+    * @return True if this schemaFormat denotes an Avro schema, false otherwise
+    */
+   public static boolean isAvroSchemaFormat(String schemaFormat) {
+      return schemaFormat != null && schemaFormat.startsWith(AVRO_SCHEMA_FORMAT_PREFIX);
+   }
+
+   /**
+    * Unwrap the AsyncAPI v3 <i>Multi Format Schema Object</i> that may be used as a message payload. In AsyncAPI v3, an
+    * Avro payload is expressed as
+    * <code>payload: {schemaFormat: "application/vnd.apache.avro;version=1.9.0", schema: {...}}</code> whereas in
+    * AsyncAPI v2 the payload node is directly the Avro schema. This returns the inner {@code schema} node when such a
+    * wrapper is detected and the unchanged node otherwise, which keeps the AsyncAPI v2 handling untouched.
+    * @param payloadNode         The message payload node to inspect
+    * @param messageSchemaFormat The schemaFormat declared at the Message Object level, may be null
+    * @return The effective Avro schema node for this payload
+    */
+   public static JsonNode unwrapAvroMultiFormatSchema(JsonNode payloadNode, String messageSchemaFormat) {
+      // A Multi Format Schema Object only holds 'schemaFormat' and 'schema' members while an Avro schema node always
+      // carries a 'type': its presence tells us we're on an AsyncAPI v2 payload that must be left untouched.
+      if (!payloadNode.has(SCHEMA_ELEMENT) || payloadNode.has(TYPE_ELEMENT)) {
+         return payloadNode;
+      }
+
+      // schemaFormat is mandatory on a Multi Format Schema Object but tolerate documents hoisting it on the Message
+      // Object as AsyncAPI v2 was doing.
+      String schemaFormat = messageSchemaFormat;
+      if (payloadNode.has(SCHEMA_FORMAT_ELEMENT)) {
+         schemaFormat = payloadNode.path(SCHEMA_FORMAT_ELEMENT).asText();
+      }
+
+      if (isAvroSchemaFormat(schemaFormat)) {
+         log.debug("Unwrapping an AsyncAPI v3 Multi Format Schema Object having format {}", schemaFormat);
+         return payloadNode.path(SCHEMA_ELEMENT);
+      }
+      return payloadNode;
+   }
+
+   /** Build an Avro schema for a single message definition. */
+   private static Schema buildSingleMessageAvroSchema(JsonNode messageNode, JsonNode specificationNode,
+         SchemaMap schemaMap) throws AsyncAPISchemaException {
       // Check that message node has a payload attribute.
       if (!messageNode.has(ASYNC_SCHEMA_PAYLOAD_ELEMENT)) {
          log.debug("messageNode {} has no 'payload' attribute", messageNode);
          throw new AsyncAPISchemaException("message definition has no valid payload in AsyncAPI specification");
       }
 
-      // Navigate to payload definition.
-      messageNode = messageNode.path(ASYNC_SCHEMA_PAYLOAD_ELEMENT);
+      // Remember the Message Object schemaFormat: AsyncAPI v2 declares it there and some v3 documents still do.
+      String messageSchemaFormat = messageNode.has(SCHEMA_FORMAT_ELEMENT)
+            ? messageNode.path(SCHEMA_FORMAT_ELEMENT).asText()
+            : null;
+
+      // Navigate to payload definition, unwrapping the AsyncAPI v3 Multi Format Schema Object if any so that the rest
+      // of the processing is AsyncAPI version agnostic.
+      JsonNode payloadNode = unwrapAvroMultiFormatSchema(messageNode.path(ASYNC_SCHEMA_PAYLOAD_ELEMENT),
+            messageSchemaFormat);
 
       // Payload node can be just a reference to another schema... But in the case of Avro, this is an external schema
       // as #/components/schemas can only hold JSON schemas. So we have to use a registry for resolving and accessing
       // this Avro schema. We'll have to build an Avro Schema either from payload content or registry content.
       String schemaContent = null;
 
-      if (messageNode.has("$ref")) {
-         // Remove trailing anchor marker if any.
-         // './user-signedup.avsc#/User' => './user-signedup.avsc'
-         String ref = messageNode.path("$ref").asText();
-         log.debug("Looking for an external Avro schema in registry: {}", ref);
-         if (ref.contains("#")) {
-            ref = ref.substring(0, ref.indexOf("#"));
-         }
-         if (schemaMap != null) {
-            schemaContent = schemaMap.getSchemaEntry(ref);
-         }
-         if (schemaContent == null) {
-            log.info("No schema content found in SchemaMap. {} is not found", ref);
-            throw new AsyncAPISchemaException("no schema content found for " + ref + " in used SchemaMap.");
+      if (payloadNode.has(REF_ELEMENT)) {
+         String ref = payloadNode.path(REF_ELEMENT).asText();
+         if (ref.startsWith("#")) {
+            // An internal reference: the Avro schema is inlined somewhere else within the document.
+            log.debug("Following an internal reference to an Avro schema: {}", ref);
+            schemaContent = unwrapAvroMultiFormatSchema(followRefIfAny(payloadNode, specificationNode),
+                  messageSchemaFormat).toString();
+         } else {
+            // Remove trailing anchor marker if any.
+            // './user-signedup.avsc#/User' => './user-signedup.avsc'
+            log.debug("Looking for an external Avro schema in registry: {}", ref);
+            if (ref.contains("#")) {
+               ref = ref.substring(0, ref.indexOf("#"));
+            }
+            if (schemaMap != null) {
+               schemaContent = schemaMap.getSchemaEntry(ref);
+            }
+            if (schemaContent == null) {
+               log.info("No schema content found in SchemaMap. {} is not found", ref);
+               throw new AsyncAPISchemaException("no schema content found for " + ref + " in used SchemaMap.");
+            }
          }
       } else {
          // Schema is specified within the payload definition.
-         schemaContent = messageNode.toString();
+         schemaContent = payloadNode.toString();
       }
 
       // Now build and return the schema.
-      return AvroUtil.getSchema(schemaContent);
+      try {
+         return AvroUtil.getSchema(schemaContent);
+      } catch (AvroRuntimeException are) {
+         // SchemaParseException is unchecked: turn it into the checked exception callers already handle so that an
+         // invalid Avro schema is reported as a validation error instead of killing the calling thread.
+         log.info("Avro schema content cannot be parsed: {}", are.getMessage());
+         throw new AsyncAPISchemaException("Avro schema cannot be parsed: " + are.getMessage(), are);
+      }
    }
 
    /** Check if a node has a reference and follow it to target node in the document. */
